@@ -1,0 +1,12 @@
+# Rust build artifacts
+/target
+
+# If you are developing a library, some prefer to ignore Cargo.lock
+# If it's a binary/executable, you SHOULD commit Cargo.lock
+# Cargo.lock
+
+# Optional: IDE and OS specific files
+.idea/
+.vscode/
+*.pdb
+*.rs.bk
