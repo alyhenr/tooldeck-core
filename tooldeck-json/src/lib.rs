@@ -1,44 +1,38 @@
 use serde_json::Value;
 
-/// Filters a JSON array of objects by a specific key-value pair.
-/// Returns a pretty-printed JSON string of the filtered array.
-pub fn filter_by_key_value(
-    input_json: &str,
+/// Node 1: Filters an array of objects IN-PLACE based on a key-value match.
+pub fn filter_by_key_value_mut(
+    data: &mut Value,
     target_key: &str,
     target_value: &str,
-) -> Result<String, String> {
-    
-    // 1. Parse the raw string into a serde_json::Value
-    let parsed_data: Value = serde_json::from_str(input_json)
-        .map_err(|e| format!("Failed to parse JSON: {}", e))?;
+) -> Result<(), String> {
+    let array = data.as_array_mut().ok_or("Input must be an array of objects")?;
 
-    // 2. Ensure the root structure is actually an array
-    let array = parsed_data
-        .as_array()
-        .ok_or_else(|| "Input JSON must be an array of objects".to_string())?;
+    array.retain(|item| {
+        item.as_object()
+            .and_then(|obj| obj.get(target_key))
+            .and_then(|val| val.as_str())
+            .map_or(false, |v| v == target_value)
+    });
 
-    // 3. Filter the array
-    let filtered_array: Vec<Value> = array
-        .iter()
-        .filter(|item| {
-            // Ensure the item is an object
-            if let Some(obj) = item.as_object() {
-                // Check if the key exists
-                if let Some(val) = obj.get(target_key) {
-                    // Check if the value matches (handling it as a string for this MVP)
-                    if let Some(val_str) = val.as_str() {
-                        return val_str == target_value;
-                    }
-                }
-            }
-            false
-        })
-        .cloned() // Clone the matched items into the new Vec
-        .collect();
+    Ok(())
+}
 
-    // 4. Serialize the filtered Vec back into a pretty JSON string
-    serde_json::to_string_pretty(&Value::Array(filtered_array))
-        .map_err(|e| format!("Failed to serialize result: {}", e))
+/// Node 2: Strips unwanted keys from every object in an array IN-PLACE.
+pub fn retain_keys_mut(
+    data: &mut Value, 
+    keys_to_keep: &[&str]
+) -> Result<(), String> {
+    let array = data.as_array_mut().ok_or("Input must be an array of objects")?;
+
+    for item in array {
+        if let Some(obj) = item.as_object_mut() {
+            // retain() keeps only the key-value pairs where the closure returns true
+            obj.retain(|key, _| keys_to_keep.contains(&key.as_str()));
+        }
+    }
+
+    Ok(())
 }
 
 // --- UNIT TESTS ---
@@ -46,40 +40,40 @@ pub fn filter_by_key_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
-    fn test_filter_active_users() {
-        // Hardcoded mock JSON
-        let mock_input = r#"
-        [
-            {"id": 1, "name": "Alice", "status": "active", "role": "admin"},
-            {"id": 2, "name": "Bob", "status": "inactive", "role": "user"},
-            {"id": 3, "name": "Charlie", "status": "active", "role": "user"},
-            {"id": 4, "name": "Dave", "status": "pending", "role": "user"}
-        ]
-        "#;
+    fn test_filter_by_key_value_mut() {
+        let mut data = json!([
+            {"id": 1, "tier": "pro", "name": "Alice"},
+            {"id": 2, "tier": "free", "name": "Bob"},
+            {"id": 3, "tier": "pro", "name": "Charlie"}
+        ]);
 
-        // Run the engine
-        let result = filter_by_key_value(mock_input, "status", "active").unwrap();
+        filter_by_key_value_mut(&mut data, "tier", "pro").unwrap();
 
-        // The expected output (parsed to Value for safe comparison ignoring whitespace)
-        let expected_json = r#"
-        [
-            {"id": 1, "name": "Alice", "status": "active", "role": "admin"},
-            {"id": 3, "name": "Charlie", "status": "active", "role": "user"}
-        ]
-        "#;
-        
-        let actual_val: Value = serde_json::from_str(&result).unwrap();
-        let expected_val: Value = serde_json::from_str(expected_json).unwrap();
+        let expected = json!([
+            {"id": 1, "tier": "pro", "name": "Alice"},
+            {"id": 3, "tier": "pro", "name": "Charlie"}
+        ]);
 
-        assert_eq!(actual_val, expected_val, "The filtered JSON did not match expected output.");
+        assert_eq!(data, expected);
     }
 
     #[test]
-    fn test_invalid_json_returns_error() {
-        let bad_input = r#"[ {"id": 1, "name": "missing quotes } ]"#;
-        let result = filter_by_key_value(bad_input, "status", "active");
-        assert!(result.is_err());
+    fn test_retain_keys_mut() {
+        let mut data = json!([
+            {"id": "A1", "name": "Alice", "secret": "xyz", "email": "a@a.com"},
+            {"id": "B2", "name": "Bob", "secret": "abc", "email": "b@b.com"}
+        ]);
+
+        retain_keys_mut(&mut data, &["name", "email"]).unwrap();
+
+        let expected = json!([
+            {"name": "Alice", "email": "a@a.com"},
+            {"name": "Bob", "email": "b@b.com"}
+        ]);
+
+        assert_eq!(data, expected);
     }
 }

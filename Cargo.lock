@@ -114,6 +114,8 @@ dependencies = [
 name = "tooldeck-engine"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "tooldeck-json",
  "wasm-bindgen",
 ]
