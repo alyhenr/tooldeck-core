@@ -1,0 +1,1 @@
+/Users/alyssonalmeida/github/tooldeck-core/target/wasm32-unknown-unknown/release/tooldeck_engine.wasm: /Users/alyssonalmeida/github/tooldeck-core/tooldeck-engine/src/lib.rs /Users/alyssonalmeida/github/tooldeck-core/tooldeck-json/src/lib.rs
