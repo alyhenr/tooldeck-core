@@ -1,38 +1,76 @@
-use serde_json::Value;
+use arrow::array::{BooleanArray, StringArray};
+use arrow::compute::filter_record_batch;
+use arrow::record_batch::RecordBatch;
+use arrow_json::{reader::infer_json_schema, ReaderBuilder, writer::LineDelimitedWriter};
+use std::io::Cursor;
+use std::sync::Arc;
 
-/// Node 1: Filters an array of objects IN-PLACE based on a key-value match.
-pub fn filter_by_key_value_mut(
-    data: &mut Value,
-    target_key: &str,
-    target_value: &str,
-) -> Result<(), String> {
-    let array = data.as_array_mut().ok_or("Input must be an array of objects")?;
+// ==========================================
+// 1. THE INGEST EDGE (NDJSON -> Arrow)
+// ==========================================
+pub fn json_to_arrow(ndjson_str: &str) -> Result<RecordBatch, String> {
+    let mut cursor = Cursor::new(ndjson_str.as_bytes());
 
-    array.retain(|item| {
-        item.as_object()
-            .and_then(|obj| obj.get(target_key))
-            .and_then(|val| val.as_str())
-            .map_or(false, |v| v == target_value)
-    });
+    let (schema, _) = infer_json_schema(&mut cursor, None)
+        .map_err(|e| format!("Failed to infer Arrow schema: {}", e))?;
 
-    Ok(())
+    cursor.set_position(0);
+
+    let mut reader = ReaderBuilder::new(Arc::new(schema))
+        .build(cursor)
+        .map_err(|e| format!("Failed to build Arrow JSON reader: {}", e))?;
+
+    match reader.next() {
+        Some(Ok(batch)) => Ok(batch),
+        Some(Err(e)) => Err(format!("Failed to read RecordBatch: {}", e)),
+        None => Err("JSON file was empty.".to_string()),
+    }
 }
 
-/// Node 2: Strips unwanted keys from every object in an array IN-PLACE.
-pub fn retain_keys_mut(
-    data: &mut Value, 
-    keys_to_keep: &[&str]
-) -> Result<(), String> {
-    let array = data.as_array_mut().ok_or("Input must be an array of objects")?;
+// ==========================================
+// 2. THE TOOL (Arrow -> Arrow)
+// ==========================================
+/// Filters an Arrow RecordBatch where a specific string column matches a value.
+pub fn filter_by_string_col(
+    batch: &RecordBatch,
+    col_name: &str,
+    target_value: &str,
+) -> Result<RecordBatch, String> {
+    
+    // 1. Find the column index
+    let col_idx = batch.schema().index_of(col_name)
+        .map_err(|_| format!("Column '{}' not found in schema", col_name))?;
 
-    for item in array {
-        if let Some(obj) = item.as_object_mut() {
-            // retain() keeps only the key-value pairs where the closure returns true
-            obj.retain(|key, _| keys_to_keep.contains(&key.as_str()));
-        }
+    // 2. Extract the column and downcast it to a String Array
+    let col = batch.column(col_idx);
+    let string_col = col.as_any().downcast_ref::<StringArray>()
+        .ok_or_else(|| format!("Column '{}' is not a string type", col_name))?;
+
+    // 3. Build a Boolean Mask (True if it matches, False if it doesn't)
+    // This is blazing fast because it only scans the contiguous string block.
+    let mask: BooleanArray = string_col.iter().map(|val| {
+        val == Some(target_value)
+    }).collect();
+
+    // 4. Use Arrow's highly optimized compute kernel to apply the mask to the whole table
+    filter_record_batch(batch, &mask)
+        .map_err(|e| format!("Failed to apply compute filter: {}", e))
+}
+
+// ==========================================
+// 3. THE EXPORT EDGE (Arrow -> NDJSON)
+// ==========================================
+pub fn arrow_to_json(batch: &RecordBatch) -> Result<String, String> {
+    let mut buf = Vec::new();
+    
+    // We use a block here to drop the writer so it flushes to the buffer
+    {
+        let mut writer = LineDelimitedWriter::new(&mut buf);
+        writer.write(batch).map_err(|e| format!("Write error: {}", e))?;
+        writer.finish().map_err(|e| format!("Finish error: {}", e))?;
     }
 
-    Ok(())
+    String::from_utf8(buf).map_err(|e| format!("UTF8 conversion error: {}", e))
 }
 
 // --- UNIT TESTS ---
@@ -40,40 +78,19 @@ pub fn retain_keys_mut(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
-    fn test_filter_by_key_value_mut() {
-        let mut data = json!([
-            {"id": 1, "tier": "pro", "name": "Alice"},
-            {"id": 2, "tier": "free", "name": "Bob"},
-            {"id": 3, "tier": "pro", "name": "Charlie"}
-        ]);
+    fn test_json_to_arrow_ingest() {
+        // We use NDJSON (JSONLines) - the industry standard for streaming big data.
+        // No commas between objects, no outer array brackets. Just newlines.
+        let raw_json = r#"{"id": 1, "name": "Alice", "active": true}
+{"id": 2, "name": "Bob", "active": false}"#;
 
-        filter_by_key_value_mut(&mut data, "tier", "pro").unwrap();
+        let batch = json_to_arrow(raw_json).expect("Failed to ingest JSON");
 
-        let expected = json!([
-            {"id": 1, "tier": "pro", "name": "Alice"},
-            {"id": 3, "tier": "pro", "name": "Charlie"}
-        ]);
+        assert_eq!(batch.num_columns(), 3, "Should have 3 columns");
+        assert_eq!(batch.num_rows(), 2, "Should have 2 rows");
 
-        assert_eq!(data, expected);
-    }
-
-    #[test]
-    fn test_retain_keys_mut() {
-        let mut data = json!([
-            {"id": "A1", "name": "Alice", "secret": "xyz", "email": "a@a.com"},
-            {"id": "B2", "name": "Bob", "secret": "abc", "email": "b@b.com"}
-        ]);
-
-        retain_keys_mut(&mut data, &["name", "email"]).unwrap();
-
-        let expected = json!([
-            {"name": "Alice", "email": "a@a.com"},
-            {"name": "Bob", "email": "b@b.com"}
-        ]);
-
-        assert_eq!(data, expected);
+        println!("Inferred Schema:\n{:#?}", batch.schema());
     }
 }
