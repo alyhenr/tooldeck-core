@@ -1,0 +1,10 @@
+[package]
+name = "tooldeck-registry"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrow = { version = "58.1", default-features = false }
+arrow-json = "58.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

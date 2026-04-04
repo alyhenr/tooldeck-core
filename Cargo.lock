@@ -768,12 +768,26 @@ name = "tooldeck-engine"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.3.4",
+ "js-sys",
+ "serde_json",
  "tooldeck-json",
+ "tooldeck-registry",
  "wasm-bindgen",
 ]
 
 [[package]]
 name = "tooldeck-json"
+version = "0.1.0"
+dependencies = [
+ "arrow",
+ "arrow-json",
+ "serde",
+ "serde_json",
+ "tooldeck-registry",
+]
+
+[[package]]
+name = "tooldeck-registry"
 version = "0.1.0"
 dependencies = [
  "arrow",
