@@ -6,12 +6,11 @@ use tooldeck_registry::{
 };
 
 // ============================================================
-// GLOBAL REGISTRY — initialized once, used for all calls
+// GLOBAL REGISTRY
 // ============================================================
 
 fn build_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    // Register all tool crates. Adding a new crate = one line here.
     tooldeck_json::register(&mut registry);
     registry
 }
@@ -26,16 +25,20 @@ thread_local! {
 
 #[wasm_bindgen]
 pub fn get_tool_registry() -> String {
-    REGISTRY.with(|r| serde_json::to_string(&r.manifest()).unwrap())
+    REGISTRY.with(|r| serde_json::to_string(&r.manifest()).expect("Failed to serialize manifest"))
 }
 
+/// Execute a pipeline with real-time progress reporting.
+/// `progress_callback` receives a JSON string for each node event:
+///   { "event": "node_started", "node_id": "..." }
+///   { "event": "node_completed", "node_id": "...", "result": { ... } }
 #[wasm_bindgen]
-pub fn run_pipeline(pipeline_json: &str) -> Result<String, JsValue> {
+pub fn run_pipeline(pipeline_json: &str, progress_callback: &js_sys::Function) -> Result<String, JsValue> {
     let pipeline: PipelineDescription = serde_json::from_str(pipeline_json)
         .map_err(|e| JsValue::from_str(&format!("Pipeline parse error: {e}")))?;
 
     let result = REGISTRY.with(|registry| {
-        execute_pipeline(&pipeline, registry)
+        execute_pipeline(&pipeline, registry, progress_callback)
     });
 
     match result {
@@ -46,16 +49,20 @@ pub fn run_pipeline(pipeline_json: &str) -> Result<String, JsValue> {
 }
 
 // ============================================================
-// PIPELINE EXECUTOR — generic, no tool-specific code
+// PIPELINE EXECUTOR
 // ============================================================
+
+fn emit_progress(callback: &js_sys::Function, json: &str) {
+    let _ = callback.call1(&JsValue::NULL, &JsValue::from_str(json));
+}
 
 fn execute_pipeline(
     pipeline: &PipelineDescription,
     registry: &ToolRegistry,
+    progress: &js_sys::Function,
 ) -> Result<PipelineResult, String> {
     let sorted = topological_sort(pipeline)?;
 
-    // Data store: node_id:port_name → DataPayload
     let mut data_store: HashMap<String, DataPayload> = HashMap::new();
     let mut node_results: HashMap<String, NodeResult> = HashMap::new();
 
@@ -67,21 +74,20 @@ fn execute_pipeline(
         let handler = registry.get_handler(tool_id)
             .ok_or_else(|| format!("Unknown tool: {tool_id}"))?;
 
+        // Report: node started
+        emit_progress(progress, &format!(
+            r#"{{"event":"node_started","node_id":"{node_id}"}}"#
+        ));
+
         let start = js_sys::Date::now();
-
-        // Resolve inputs for this node
         let inputs = resolve_node_inputs(node_id, handler, pipeline, &data_store)?;
-
-        // Build execution context
         let mut ctx = ExecutionContext::new(inputs, node.params.clone());
 
-        // Execute the tool
         match handler.execute(&mut ctx) {
             Ok(()) => {
                 let duration_ms = js_sys::Date::now() - start;
                 let outputs = ctx.into_outputs();
 
-                // Get preview + row count from first output
                 let mut preview = None;
                 let mut output_rows = None;
                 if let Some((_, payload)) = outputs.iter().next() {
@@ -89,30 +95,47 @@ fn execute_pipeline(
                     output_rows = payload.row_count();
                 }
 
-                // Store all outputs in the data store
                 for (port_name, payload) in outputs {
                     data_store.insert(format!("{node_id}:{port_name}"), payload);
                 }
 
-                node_results.insert(node_id.clone(), NodeResult {
+                let node_result = NodeResult {
                     status: "success".into(),
                     duration_ms: Some(duration_ms),
                     output_rows,
                     error: None,
                     preview,
-                });
+                };
+
+                // Report: node completed
+                if let Ok(result_json) = serde_json::to_string(&node_result) {
+                    emit_progress(progress, &format!(
+                        r#"{{"event":"node_completed","node_id":"{node_id}","result":{result_json}}}"#
+                    ));
+                }
+
+                node_results.insert(node_id.clone(), node_result);
             }
             Err(e) => {
                 let duration_ms = js_sys::Date::now() - start;
-                node_results.insert(node_id.clone(), NodeResult {
+
+                let node_result = NodeResult {
                     status: "error".into(),
                     duration_ms: Some(duration_ms),
                     output_rows: None,
                     error: Some(e.clone()),
                     preview: None,
-                });
+                };
 
-                // Mark remaining nodes as skipped
+                // Report: node failed
+                if let Ok(result_json) = serde_json::to_string(&node_result) {
+                    emit_progress(progress, &format!(
+                        r#"{{"event":"node_completed","node_id":"{node_id}","result":{result_json}}}"#
+                    ));
+                }
+
+                node_results.insert(node_id.clone(), node_result);
+
                 let failed_idx = sorted.iter().position(|id| id == node_id).unwrap();
                 for remaining_id in sorted.iter().skip(failed_idx + 1) {
                     node_results.insert(remaining_id.clone(), NodeResult {
@@ -135,15 +158,15 @@ fn execute_pipeline(
         }
     }
 
-    // Collect terminal outputs — nodes whose ports have no outgoing edge
+    // Collect terminal outputs
     let nodes_with_outgoing: std::collections::HashSet<String> =
         pipeline.edges.iter().map(|e| e.from.node.clone()).collect();
 
     let mut terminal_outputs: HashMap<String, String> = HashMap::new();
     let terminal_keys: Vec<String> = data_store.keys()
         .filter(|key| {
-            let node_id = key.split(':').next().unwrap();
-            !nodes_with_outgoing.contains(node_id)
+            let nid = key.split(':').next().unwrap();
+            !nodes_with_outgoing.contains(nid)
         })
         .cloned()
         .collect();
@@ -166,7 +189,7 @@ fn execute_pipeline(
 }
 
 // ============================================================
-// INPUT RESOLUTION — generic, follows edges
+// INPUT RESOLUTION
 // ============================================================
 
 fn resolve_node_inputs(
@@ -179,7 +202,6 @@ fn resolve_node_inputs(
     let mut inputs: HashMap<String, DataPayload> = HashMap::new();
 
     for input_port in &spec.inputs {
-        // Find the edge connecting to this port
         let incoming = pipeline.edges.iter().find(|e| {
             e.to.node == node_id && e.to.port == input_port.name
         });
@@ -192,7 +214,6 @@ fn resolve_node_inputs(
             let payload = data_store.get(&key)
                 .ok_or_else(|| format!("No data at {key} for input {node_id}:{port_name}"))?;
 
-            // Clone the payload for the tool to consume
             let cloned = match payload {
                 DataPayload::Text(t) => DataPayload::Text(t.clone()),
                 DataPayload::Arrow(b) => DataPayload::Arrow(b.clone()),
@@ -204,7 +225,6 @@ fn resolve_node_inputs(
             if let Some(text) = pipeline.provided_inputs.get(&key) {
                 inputs.insert(input_port.name.clone(), DataPayload::Text(text.clone()));
             }
-            // If no data at all, the tool will get an error when it tries to read the input
         }
     }
 
