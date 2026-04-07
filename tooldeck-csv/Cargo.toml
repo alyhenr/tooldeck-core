@@ -1,0 +1,10 @@
+[package]
+name = "tooldeck-csv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tooldeck-registry = { path = "../tooldeck-registry" }
+arrow = { version = "58.1", default-features = false }
+arrow-csv = "58.1"
+arrow-schema = "58.1"

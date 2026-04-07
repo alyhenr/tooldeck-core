@@ -3,5 +3,7 @@ resolver = "3"
 members = [
     "tooldeck-registry",
     "tooldeck-json",
+    "tooldeck-csv",
+    "tooldeck-transforms",
     "tooldeck-engine",
 ]

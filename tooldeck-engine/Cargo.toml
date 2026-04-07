@@ -13,4 +13,6 @@ serde_json = "1.0"
 tooldeck-registry = { path = "../tooldeck-registry" }
 # Tool crates — each adds its tools to the registry
 tooldeck-json = { path = "../tooldeck-json" }
+tooldeck-csv = { path = "../tooldeck-csv" }
+tooldeck-transforms = { path = "../tooldeck-transforms" }
 getrandom = { version = "0.3", features = ["wasm_js"] }

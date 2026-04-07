@@ -12,6 +12,8 @@ use tooldeck_registry::{
 fn build_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
     tooldeck_json::register(&mut registry);
+    tooldeck_csv::register(&mut registry);
+    tooldeck_transforms::register(&mut registry);
     registry
 }
 

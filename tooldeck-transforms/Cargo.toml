@@ -1,0 +1,12 @@
+[package]
+name = "tooldeck-transforms"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tooldeck-registry = { path = "../tooldeck-registry" }
+arrow = { version = "58.1", default-features = false, features = ["prettyprint"] }
+arrow-array = "58.1"
+arrow-ord = "58.1"
+arrow-schema = "58.1"
+arrow-select = "58.1"
