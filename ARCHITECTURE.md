@@ -107,7 +107,7 @@ fn build_registry() -> ToolRegistry {
 ./scripts/sync-engine.sh
 ```
 
-The frontend discovers the new tool automatically. No frontend changes needed.
+The frontend discovers the new tool automatically. **The only frontend change needed is for new icons:** if your tool uses a Lucide icon that isn't already in the frontend's icon registry, add one entry to `tooldeck-ui/src/lib/icon-map.ts` (one import + one map entry). All existing icons work out of the box.
 
 ## Key Abstractions
 

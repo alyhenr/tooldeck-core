@@ -217,15 +217,18 @@ fn resolve_node_inputs(
                 .ok_or_else(|| format!("No data at {key} for input {node_id}:{port_name}"))?;
 
             let cloned = match payload {
-                DataPayload::Text(t) => DataPayload::Text(t.clone()),
-                DataPayload::Arrow(b) => DataPayload::Arrow(b.clone()),
+                DataPayload::Text { content, format } => DataPayload::Text { content: content.clone(), format: *format },
+                DataPayload::Arrow { batch, source_format } => DataPayload::Arrow { batch: batch.clone(), source_format: *source_format },
             };
             inputs.insert(input_port.name.clone(), cloned);
         } else {
             let port_name = &input_port.name;
             let key = format!("{node_id}:{port_name}");
-            if let Some(text) = pipeline.provided_inputs.get(&key) {
-                inputs.insert(input_port.name.clone(), DataPayload::Text(text.clone()));
+            if let Some(input) = pipeline.provided_inputs.get(&key) {
+                inputs.insert(
+                    input_port.name.clone(),
+                    DataPayload::text(input.content.clone(), input.format),
+                );
             }
         }
     }

@@ -779,8 +779,6 @@ name = "tooldeck-csv"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "arrow-csv",
- "arrow-schema",
  "tooldeck-registry",
 ]
 
@@ -803,9 +801,6 @@ name = "tooldeck-json"
 version = "0.1.0"
 dependencies = [
  "arrow",
- "arrow-json",
- "serde",
- "serde_json",
  "tooldeck-registry",
 ]
 
@@ -814,7 +809,9 @@ name = "tooldeck-registry"
 version = "0.1.0"
 dependencies = [
  "arrow",
+ "arrow-csv",
  "arrow-json",
+ "arrow-schema",
  "serde",
  "serde_json",
 ]

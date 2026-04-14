@@ -1,12 +1,12 @@
-use arrow::array::{Array, ArrayRef, StringArray, BooleanArray};
+use arrow::array::{ArrayRef, BooleanArray};
 use arrow::compute;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{Field, Schema};
 use std::collections::HashSet;
 use std::sync::Arc;
 use tooldeck_registry::{
-    ExecutionContext, ToolHandler, ToolRegistry, ToolSpec,
-    port, string_param, string_array_param,
+    cell_to_string, ExecutionContext, ToolHandler, ToolRegistry, ToolSpec,
+    port_with_format, string_param, string_array_param,
 };
 
 // ============================================================
@@ -35,10 +35,10 @@ impl ToolHandler for SelectColumns {
             id: "select_columns".into(),
             label: "Select Columns".into(),
             description: "Keep only specified columns".into(),
-            category: "transform".into(),
+            category: "data".into(),
             icon: "Columns3".into(),
-            inputs: vec![port("data", "Text")],
-            outputs: vec![port("selected", "Text")],
+            inputs: vec![port_with_format("data", "Text", "tabular")],
+            outputs: vec![port_with_format("result", "Text", "tabular")],
             params: vec![string_array_param("columns", "Columns to keep")],
         }
     }
@@ -47,7 +47,7 @@ impl ToolHandler for SelectColumns {
         let batch = ctx.input_arrow("data")?;
         let columns = ctx.param_str_array("columns")?;
         let result = select_columns(&batch, &columns)?;
-        ctx.set_output_arrow("selected", result);
+        ctx.set_output_arrow("result", result);
         Ok(())
     }
 }
@@ -87,10 +87,10 @@ impl ToolHandler for RenameColumn {
             id: "rename_column".into(),
             label: "Rename Column".into(),
             description: "Rename a column in the table".into(),
-            category: "transform".into(),
+            category: "data".into(),
             icon: "TextCursorInput".into(),
-            inputs: vec![port("data", "Text")],
-            outputs: vec![port("renamed", "Text")],
+            inputs: vec![port_with_format("data", "Text", "tabular")],
+            outputs: vec![port_with_format("result", "Text", "tabular")],
             params: vec![
                 string_param("from", "Current Name"),
                 string_param("to", "New Name"),
@@ -103,7 +103,7 @@ impl ToolHandler for RenameColumn {
         let from = ctx.param_str("from")?;
         let to = ctx.param_str("to")?;
         let result = rename_columns(&batch, from, to)?;
-        ctx.set_output_arrow("renamed", result);
+        ctx.set_output_arrow("result", result);
         Ok(())
     }
 }
@@ -150,10 +150,10 @@ impl ToolHandler for SortRows {
             id: "sort_rows".into(),
             label: "Sort Rows".into(),
             description: "Sort rows by a column".into(),
-            category: "transform".into(),
+            category: "data".into(),
             icon: "ArrowUpDown".into(),
-            inputs: vec![port("data", "Text")],
-            outputs: vec![port("sorted", "Text")],
+            inputs: vec![port_with_format("data", "Text", "tabular")],
+            outputs: vec![port_with_format("result", "Text", "tabular")],
             params: vec![
                 string_param("column", "Sort by Column"),
                 string_param("direction", "Direction (asc/desc)"),
@@ -167,7 +167,7 @@ impl ToolHandler for SortRows {
         let direction = ctx.param_str("direction").unwrap_or("asc");
         let ascending = direction != "desc";
         let result = sort_rows(&batch, column, ascending)?;
-        ctx.set_output_arrow("sorted", result);
+        ctx.set_output_arrow("result", result);
         Ok(())
     }
 }
@@ -200,16 +200,8 @@ pub fn deduplicate(
         let mut key = String::new();
         for &col_idx in &key_indices {
             let col = batch.column(col_idx);
-            // Use the string representation of each cell as part of the key
-            if col.is_null(row) {
-                key.push_str("__NULL__");
-            } else if let Some(s) = col.as_any().downcast_ref::<StringArray>() {
-                key.push_str(s.value(row));
-            } else {
-                // Fallback: use debug format for non-string columns
-                key.push_str(&format!("{:?}", col.slice(row, 1)));
-            }
-            key.push('\0'); // separator
+            key.push_str(&cell_to_string(col.as_ref(), row));
+            key.push('\0');
         }
 
         if seen.insert(key) {
@@ -232,10 +224,10 @@ impl ToolHandler for Deduplicate {
             id: "deduplicate".into(),
             label: "Deduplicate".into(),
             description: "Remove duplicate rows by key columns".into(),
-            category: "transform".into(),
+            category: "data".into(),
             icon: "CopyMinus".into(),
-            inputs: vec![port("data", "Text")],
-            outputs: vec![port("unique", "Text")],
+            inputs: vec![port_with_format("data", "Text", "tabular")],
+            outputs: vec![port_with_format("result", "Text", "tabular")],
             params: vec![string_array_param("key_columns", "Key Columns")],
         }
     }
@@ -244,7 +236,7 @@ impl ToolHandler for Deduplicate {
         let batch = ctx.input_arrow("data")?;
         let keys = ctx.param_str_array("key_columns")?;
         let result = deduplicate(&batch, &keys)?;
-        ctx.set_output_arrow("unique", result);
+        ctx.set_output_arrow("result", result);
         Ok(())
     }
 }
