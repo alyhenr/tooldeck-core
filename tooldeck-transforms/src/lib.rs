@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use tooldeck_registry::{
     cell_to_string, ExecutionContext, ToolHandler, ToolRegistry, ToolSpec,
-    port_with_format, string_param, string_array_param,
+    port_with_format, string_param, string_array_param, select_param,
 };
 
 // ============================================================
@@ -242,6 +242,520 @@ impl ToolHandler for Deduplicate {
 }
 
 // ============================================================
+// GROUP BY — aggregate rows by key columns
+// ============================================================
+
+pub fn group_by(
+    batch: &RecordBatch,
+    group_cols: &[&str],
+    aggregations: &[&str],
+) -> Result<RecordBatch, String> {
+    if batch.num_rows() == 0 {
+        return Ok(batch.clone());
+    }
+
+    let group_indices: Vec<usize> = group_cols
+        .iter()
+        .map(|name| batch.schema().index_of(name).map_err(|_| format!("Column '{name}' not found")))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Parse aggregations: "column:operation"
+    let parsed_aggs: Vec<(&str, &str, usize)> = aggregations
+        .iter()
+        .map(|s| {
+            let parts: Vec<&str> = s.splitn(2, ':').collect();
+            if parts.len() != 2 {
+                return Err(format!("Invalid aggregation '{s}'. Use format 'column:operation' (e.g. 'amount:sum')"));
+            }
+            let col_idx = batch.schema().index_of(parts[0])
+                .map_err(|_| format!("Aggregation column '{}' not found", parts[0]))?;
+            Ok((parts[0], parts[1], col_idx))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Build groups using composite key
+    let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut group_map: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    for row in 0..batch.num_rows() {
+        let mut key = String::new();
+        for &col_idx in &group_indices {
+            key.push_str(&cell_to_string(batch.column(col_idx).as_ref(), row));
+            key.push('\0');
+        }
+        if let Some(&idx) = group_map.get(&key) {
+            groups[idx].1.push(row);
+        } else {
+            let idx = groups.len();
+            group_map.insert(key.clone(), idx);
+            groups.push((key, vec![row]));
+        }
+    }
+
+    // Build output schema: group columns + aggregation columns
+    let mut fields: Vec<Arc<Field>> = group_indices
+        .iter()
+        .map(|&i| batch.schema().field(i).clone().into())
+        .collect();
+    for &(col_name, op, _) in &parsed_aggs {
+        fields.push(Arc::new(Field::new(format!("{col_name}_{op}"), arrow_schema::DataType::Utf8, true)));
+    }
+    let out_schema = Arc::new(Schema::new(fields));
+
+    // Build output columns
+    let mut columns: Vec<ArrayRef> = Vec::new();
+
+    // Group key columns — take first row of each group
+    for &col_idx in &group_indices {
+        let col = batch.column(col_idx);
+        let mut builder = arrow::array::StringBuilder::new();
+        for (_, rows) in &groups {
+            builder.append_value(cell_to_string(col.as_ref(), rows[0]));
+        }
+        columns.push(Arc::new(builder.finish()));
+    }
+
+    // Aggregation columns
+    for &(_, op, col_idx) in &parsed_aggs {
+        let col = batch.column(col_idx);
+        let mut builder = arrow::array::StringBuilder::new();
+
+        for (_, rows) in &groups {
+            let values: Vec<f64> = rows
+                .iter()
+                .filter_map(|&r| cell_to_string(col.as_ref(), r).parse::<f64>().ok())
+                .collect();
+
+            let result = match op {
+                "count" => rows.len() as f64,
+                "sum" => values.iter().sum(),
+                "avg" => {
+                    if values.is_empty() { 0.0 }
+                    else { values.iter().sum::<f64>() / values.len() as f64 }
+                }
+                "min" => values.iter().cloned().fold(f64::INFINITY, f64::min),
+                "max" => values.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+                _ => return Err(format!("Unknown operation '{op}'. Use: count, sum, avg, min, max")),
+            };
+
+            if op == "count" || result == result.floor() {
+                builder.append_value(format!("{}", result as i64));
+            } else {
+                builder.append_value(format!("{result:.2}"));
+            }
+        }
+        columns.push(Arc::new(builder.finish()));
+    }
+
+    RecordBatch::try_new(out_schema, columns)
+        .map_err(|e| format!("Failed to build grouped result: {e}"))
+}
+
+pub struct GroupBy;
+
+impl ToolHandler for GroupBy {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            id: "group_by".into(),
+            label: "Group By".into(),
+            description: "Aggregate rows by key columns (sum, count, avg, min, max)".into(),
+            category: "data".into(),
+            icon: "Group".into(),
+            inputs: vec![port_with_format("data", "Text", "tabular")],
+            outputs: vec![port_with_format("result", "Text", "tabular")],
+            params: vec![
+                string_array_param("group_by", "Group by Columns"),
+                string_array_param("aggregations", "Aggregations (column:operation)"),
+            ],
+        }
+    }
+
+    fn execute(&self, ctx: &mut ExecutionContext) -> Result<(), String> {
+        let batch = ctx.input_arrow("data")?;
+        let group_cols = ctx.param_str_array("group_by")?;
+        let aggregations = ctx.param_str_array("aggregations")?;
+        let result = group_by(&batch, &group_cols, &aggregations)?;
+        ctx.set_output_arrow("result", result);
+        Ok(())
+    }
+}
+
+// ============================================================
+// ADD COLUMN — compute a new column from an expression
+// ============================================================
+
+pub fn add_column(
+    batch: &RecordBatch,
+    column_name: &str,
+    expression: &str,
+) -> Result<RecordBatch, String> {
+    if batch.num_rows() == 0 {
+        let mut fields: Vec<Arc<Field>> = batch.schema().fields().iter().cloned().collect();
+        fields.push(Arc::new(Field::new(column_name, arrow_schema::DataType::Utf8, true)));
+        let schema = Arc::new(Schema::new(fields));
+        return Ok(RecordBatch::new_empty(schema));
+    }
+
+    // Evaluate expression for each row
+    let mut results = arrow::array::StringBuilder::new();
+    for row in 0..batch.num_rows() {
+        let value = eval_expression(batch, row, expression)?;
+        results.append_value(value);
+    }
+
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns.push(Arc::new(results.finish()));
+
+    let mut fields: Vec<Arc<Field>> = batch.schema().fields().iter().cloned().collect();
+    fields.push(Arc::new(Field::new(column_name, arrow_schema::DataType::Utf8, true)));
+    let schema = Arc::new(Schema::new(fields));
+
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| format!("Failed to add column: {e}"))
+}
+
+/// Simple expression evaluator supporting column references, arithmetic, and string concat.
+/// Examples: "price * quantity", "first_name + ' ' + last_name", "amount / 100"
+fn eval_expression(batch: &RecordBatch, row: usize, expr: &str) -> Result<String, String> {
+    let tokens = tokenize_expression(expr);
+    if tokens.is_empty() {
+        return Err("Empty expression".into());
+    }
+
+    // Try numeric evaluation first
+    let mut numeric = true;
+    let mut values: Vec<f64> = Vec::new();
+    let mut ops: Vec<char> = Vec::new();
+
+    for token in &tokens {
+        match token {
+            Token::Op(c) => ops.push(*c),
+            Token::Literal(s) => {
+                if let Ok(n) = s.parse::<f64>() {
+                    values.push(n);
+                } else {
+                    numeric = false;
+                    break;
+                }
+            }
+            Token::Column(name) => {
+                let val = get_cell_value(batch, row, name)?;
+                if let Ok(n) = val.parse::<f64>() {
+                    values.push(n);
+                } else {
+                    numeric = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    if numeric && !values.is_empty() {
+        // Evaluate left to right with precedence: * / before + -
+        let mut result = values[0];
+        for (i, &op) in ops.iter().enumerate() {
+            let rhs = values.get(i + 1).copied().unwrap_or(0.0);
+            match op {
+                '+' => result += rhs,
+                '-' => result -= rhs,
+                '*' => result *= rhs,
+                '/' => {
+                    if rhs == 0.0 { return Ok("0".into()); }
+                    result /= rhs;
+                }
+                _ => return Err(format!("Unknown operator '{op}'")),
+            }
+        }
+        if result == result.floor() && result.abs() < 1e15 {
+            return Ok(format!("{}", result as i64));
+        }
+        return Ok(format!("{result:.2}"));
+    }
+
+    // Fall back to string concatenation
+    let mut result = String::new();
+    for token in &tokens {
+        match token {
+            Token::Op('+') => {} // string concat is implicit
+            Token::Op(c) => return Err(format!("Cannot use '{c}' on text values")),
+            Token::Literal(s) => result.push_str(s),
+            Token::Column(name) => {
+                let val = get_cell_value(batch, row, name)?;
+                result.push_str(&val);
+            }
+        }
+    }
+    Ok(result)
+}
+
+#[derive(Debug)]
+enum Token {
+    Column(String),
+    Literal(String),
+    Op(char),
+}
+
+fn tokenize_expression(expr: &str) -> Vec<Token> {
+    let mut tokens = Vec::new();
+    let mut chars = expr.chars().peekable();
+
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if "+-*/".contains(c) {
+            tokens.push(Token::Op(c));
+            chars.next();
+        } else if c == '\'' || c == '"' {
+            chars.next(); // skip opening quote
+            let mut s = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch == c { chars.next(); break; }
+                s.push(ch);
+                chars.next();
+            }
+            tokens.push(Token::Literal(s));
+        } else {
+            let mut word = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() || "+-*/".contains(ch) { break; }
+                word.push(ch);
+                chars.next();
+            }
+            if word.parse::<f64>().is_ok() {
+                tokens.push(Token::Literal(word));
+            } else {
+                tokens.push(Token::Column(word));
+            }
+        }
+    }
+    tokens
+}
+
+fn get_cell_value(batch: &RecordBatch, row: usize, col_name: &str) -> Result<String, String> {
+    let col_idx = batch.schema().index_of(col_name)
+        .map_err(|_| format!("Column '{col_name}' not found in expression"))?;
+    Ok(cell_to_string(batch.column(col_idx).as_ref(), row))
+}
+
+pub struct AddColumn;
+
+impl ToolHandler for AddColumn {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            id: "add_column".into(),
+            label: "Add Column".into(),
+            description: "Compute a new column from an expression".into(),
+            category: "data".into(),
+            icon: "Plus".into(),
+            inputs: vec![port_with_format("data", "Text", "tabular")],
+            outputs: vec![port_with_format("result", "Text", "tabular")],
+            params: vec![
+                string_param("column_name", "New Column Name"),
+                string_param("expression", "Expression"),
+            ],
+        }
+    }
+
+    fn execute(&self, ctx: &mut ExecutionContext) -> Result<(), String> {
+        let batch = ctx.input_arrow("data")?;
+        let column_name = ctx.param_str("column_name")?;
+        let expression = ctx.param_str("expression")?;
+        let result = add_column(&batch, column_name, expression)?;
+        ctx.set_output_arrow("result", result);
+        Ok(())
+    }
+}
+
+// ============================================================
+// TEXT REPLACE — find and replace within column values
+// ============================================================
+
+pub fn text_replace(
+    batch: &RecordBatch,
+    col_name: &str,
+    find: &str,
+    replace: &str,
+) -> Result<RecordBatch, String> {
+    let col_idx = batch.schema().index_of(col_name)
+        .map_err(|_| format!("Column '{col_name}' not found"))?;
+
+    let col = batch.column(col_idx);
+    let mut builder = arrow::array::StringBuilder::new();
+    for row in 0..batch.num_rows() {
+        let val = cell_to_string(col.as_ref(), row);
+        builder.append_value(val.replace(find, replace));
+    }
+
+    let new_col: ArrayRef = Arc::new(builder.finish());
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    columns[col_idx] = new_col;
+
+    // Update schema to ensure the column is Utf8
+    let mut fields: Vec<Arc<Field>> = batch.schema().fields().iter().cloned().collect();
+    fields[col_idx] = Arc::new(Field::new(col_name, arrow_schema::DataType::Utf8, true));
+    let schema = Arc::new(Schema::new(fields));
+
+    RecordBatch::try_new(schema, columns)
+        .map_err(|e| format!("Failed to replace text: {e}"))
+}
+
+pub struct TextReplace;
+
+impl ToolHandler for TextReplace {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            id: "text_replace".into(),
+            label: "Text Replace".into(),
+            description: "Find and replace text within a column".into(),
+            category: "data".into(),
+            icon: "Replace".into(),
+            inputs: vec![port_with_format("data", "Text", "tabular")],
+            outputs: vec![port_with_format("result", "Text", "tabular")],
+            params: vec![
+                string_param("column", "Column"),
+                string_param("find", "Find"),
+                string_param("replace", "Replace with"),
+            ],
+        }
+    }
+
+    fn execute(&self, ctx: &mut ExecutionContext) -> Result<(), String> {
+        let batch = ctx.input_arrow("data")?;
+        let column = ctx.param_str("column")?;
+        let find = ctx.param_str("find")?;
+        let replace = ctx.param_str("replace").unwrap_or("");
+        let result = text_replace(&batch, column, find, replace)?;
+        ctx.set_output_arrow("result", result);
+        Ok(())
+    }
+}
+
+// ============================================================
+// JOIN TABLES — SQL-style join on key columns (Pro)
+// ============================================================
+
+pub fn join_tables(
+    left: &RecordBatch,
+    right: &RecordBatch,
+    left_key: &str,
+    right_key: &str,
+    join_type: &str,
+) -> Result<RecordBatch, String> {
+    let left_key_idx = left.schema().index_of(left_key)
+        .map_err(|_| format!("Left key column '{left_key}' not found"))?;
+    let right_key_idx = right.schema().index_of(right_key)
+        .map_err(|_| format!("Right key column '{right_key}' not found"))?;
+
+    // Build index of right table by key value
+    let mut right_index: std::collections::HashMap<String, Vec<usize>> = std::collections::HashMap::new();
+    for row in 0..right.num_rows() {
+        let key = cell_to_string(right.column(right_key_idx).as_ref(), row);
+        right_index.entry(key).or_default().push(row);
+    }
+
+    // Determine which right columns to include (all except the join key to avoid duplication)
+    let right_col_indices: Vec<usize> = (0..right.num_columns())
+        .filter(|&i| i != right_key_idx)
+        .collect();
+
+    // Build output schema: all left columns + right columns (minus right key)
+    // All columns become Utf8 since we use string builders for the join output
+    let right_schema = right.schema();
+    let left_schema = left.schema();
+    let mut fields: Vec<Arc<Field>> = left_schema.fields().iter()
+        .map(|f| Arc::new(Field::new(f.name(), arrow_schema::DataType::Utf8, true)))
+        .collect();
+    for &i in &right_col_indices {
+        let f = right_schema.field(i);
+        let name = if left_schema.field_with_name(f.name()).is_ok() {
+            format!("{}_right", f.name())
+        } else {
+            f.name().to_string()
+        };
+        fields.push(Arc::new(Field::new(name, arrow_schema::DataType::Utf8, true)));
+    }
+    let out_schema = Arc::new(Schema::new(fields));
+
+    // Build output rows
+    let left_num_cols = left.num_columns();
+    let total_cols = left_num_cols + right_col_indices.len();
+    let mut builders: Vec<arrow::array::StringBuilder> = (0..total_cols)
+        .map(|_| arrow::array::StringBuilder::new())
+        .collect();
+
+    for left_row in 0..left.num_rows() {
+        let key = cell_to_string(left.column(left_key_idx).as_ref(), left_row);
+        let right_rows = right_index.get(&key);
+
+        match right_rows {
+            Some(rows) => {
+                for &right_row in rows {
+                    for (col, builder) in builders.iter_mut().enumerate().take(left_num_cols) {
+                        builder.append_value(cell_to_string(left.column(col).as_ref(), left_row));
+                    }
+                    for (i, &right_col) in right_col_indices.iter().enumerate() {
+                        builders[left_num_cols + i].append_value(
+                            cell_to_string(right.column(right_col).as_ref(), right_row),
+                        );
+                    }
+                }
+            }
+            None if join_type == "left" => {
+                for (col, builder) in builders.iter_mut().enumerate().take(left_num_cols) {
+                    builder.append_value(cell_to_string(left.column(col).as_ref(), left_row));
+                }
+                for builder in builders.iter_mut().skip(left_num_cols) {
+                    builder.append_value("");
+                }
+            }
+            _ => {} // inner join: skip rows with no match
+        }
+    }
+
+    let columns: Vec<ArrayRef> = builders.into_iter().map(|mut b| Arc::new(b.finish()) as ArrayRef).collect();
+
+    RecordBatch::try_new(out_schema, columns)
+        .map_err(|e| format!("Failed to build join result: {e}"))
+}
+
+pub struct JoinTables;
+
+impl ToolHandler for JoinTables {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec {
+            id: "join_tables".into(),
+            label: "Join Tables".into(),
+            description: "Merge two datasets on a key column".into(),
+            category: "data".into(),
+            icon: "Merge".into(),
+            inputs: vec![
+                port_with_format("left", "Text", "tabular"),
+                port_with_format("right", "Text", "tabular"),
+            ],
+            outputs: vec![port_with_format("result", "Text", "tabular")],
+            params: vec![
+                string_param("left_key", "Left Key Column"),
+                string_param("right_key", "Right Key Column"),
+                select_param("join_type", "Join Type", &["inner", "left"]),
+            ],
+        }
+    }
+
+    fn execute(&self, ctx: &mut ExecutionContext) -> Result<(), String> {
+        let left = ctx.input_arrow("left")?;
+        let right = ctx.input_arrow("right")?;
+        let left_key = ctx.param_str("left_key")?;
+        let right_key = ctx.param_str("right_key")?;
+        let join_type = ctx.param_str("join_type").unwrap_or("inner");
+        let result = join_tables(&left, &right, left_key, right_key, join_type)?;
+        ctx.set_output_arrow("result", result);
+        Ok(())
+    }
+}
+
+// ============================================================
 // REGISTRATION
 // ============================================================
 
@@ -250,6 +764,10 @@ pub fn register(registry: &mut ToolRegistry) {
     registry.register(Box::new(RenameColumn));
     registry.register(Box::new(SortRows));
     registry.register(Box::new(Deduplicate));
+    registry.register(Box::new(GroupBy));
+    registry.register(Box::new(AddColumn));
+    registry.register(Box::new(TextReplace));
+    registry.register(Box::new(JoinTables));
 }
 
 // ============================================================
