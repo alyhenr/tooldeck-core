@@ -5,5 +5,7 @@ members = [
     "tooldeck-json",
     "tooldeck-csv",
     "tooldeck-transforms",
+    "tooldeck-image",
+    "tooldeck-pdf",
     "tooldeck-engine",
 ]

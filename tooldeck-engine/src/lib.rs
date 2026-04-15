@@ -1,12 +1,14 @@
 use wasm_bindgen::prelude::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
+
 use tooldeck_registry::{
     DataPayload, ExecutionContext, ToolRegistry,
     PipelineDescription, PipelineResult, NodeResult,
 };
 
 // ============================================================
-// GLOBAL REGISTRY
+// GLOBAL REGISTRY + BINARY STORE
 // ============================================================
 
 fn build_registry() -> ToolRegistry {
@@ -14,11 +16,19 @@ fn build_registry() -> ToolRegistry {
     tooldeck_json::register(&mut registry);
     tooldeck_csv::register(&mut registry);
     tooldeck_transforms::register(&mut registry);
+    tooldeck_image::register(&mut registry);
+    tooldeck_pdf::register(&mut registry);
     registry
 }
 
 thread_local! {
     static REGISTRY: ToolRegistry = build_registry();
+    /// Binary store: holds raw bytes keyed by "nodeId:portName".
+    /// Worker calls set_binary_input before run_pipeline, and
+    /// get_binary_output after. No base64 encoding needed.
+    static BINARY_STORE: RefCell<HashMap<String, Vec<u8>>> = RefCell::new(HashMap::new());
+    /// Mime types for stored binaries.
+    static BINARY_MIME: RefCell<HashMap<String, String>> = RefCell::new(HashMap::new());
 }
 
 // ============================================================
@@ -28,6 +38,52 @@ thread_local! {
 #[wasm_bindgen]
 pub fn get_tool_registry() -> String {
     REGISTRY.with(|r| serde_json::to_string(&r.manifest()).expect("Failed to serialize manifest"))
+}
+
+/// Store raw binary data before pipeline execution.
+/// Called by the worker for each binary provided input.
+#[wasm_bindgen]
+pub fn set_binary_input(key: &str, data: &[u8], mime_type: &str) {
+    BINARY_STORE.with(|store| {
+        store.borrow_mut().insert(key.to_string(), data.to_vec());
+    });
+    BINARY_MIME.with(|mime| {
+        mime.borrow_mut().insert(key.to_string(), mime_type.to_string());
+    });
+}
+
+/// Retrieve binary output after pipeline execution.
+/// Returns the raw bytes for the given key.
+#[wasm_bindgen]
+pub fn get_binary_output(key: &str) -> Option<Vec<u8>> {
+    BINARY_STORE.with(|store| {
+        store.borrow().get(key).cloned()
+    })
+}
+
+/// Get the mime type of a binary output.
+#[wasm_bindgen]
+pub fn get_binary_output_mime(key: &str) -> Option<String> {
+    BINARY_MIME.with(|mime| {
+        mime.borrow().get(key).cloned()
+    })
+}
+
+/// Get all binary output keys (JSON array of strings).
+#[wasm_bindgen]
+pub fn get_binary_output_keys() -> String {
+    BINARY_STORE.with(|store| {
+        let binding = store.borrow();
+        let keys: Vec<&String> = binding.keys().collect();
+        serde_json::to_string(&keys).unwrap_or_else(|_| "[]".to_string())
+    })
+}
+
+/// Clear all binary data after pipeline execution.
+#[wasm_bindgen]
+pub fn clear_binary_store() {
+    BINARY_STORE.with(|store| store.borrow_mut().clear());
+    BINARY_MIME.with(|mime| mime.borrow_mut().clear());
 }
 
 /// Execute a pipeline with real-time progress reporting.
@@ -175,8 +231,25 @@ fn execute_pipeline(
 
     for key in terminal_keys {
         if let Some(payload) = data_store.remove(&key) {
-            if let Ok(text) = payload.as_text() {
-                terminal_outputs.insert(key, text);
+            match payload {
+                DataPayload::Bytes { data, mime_type } => {
+                    // Store binary output in the binary store for the worker to retrieve
+                    // via get_binary_output(). No base64 encoding needed.
+                    let output_key = format!("__output__:{key}");
+                    BINARY_STORE.with(|store| {
+                        store.borrow_mut().insert(output_key.clone(), data);
+                    });
+                    BINARY_MIME.with(|mime| {
+                        mime.borrow_mut().insert(output_key.clone(), mime_type);
+                    });
+                    // Mark as binary in terminal_outputs (worker checks for this prefix)
+                    terminal_outputs.insert(key, "__binary__".to_string());
+                }
+                _ => {
+                    if let Ok(text) = payload.as_text() {
+                        terminal_outputs.insert(key, text);
+                    }
+                }
             }
         }
     }
@@ -219,21 +292,74 @@ fn resolve_node_inputs(
             let cloned = match payload {
                 DataPayload::Text { content, format } => DataPayload::Text { content: content.clone(), format: *format },
                 DataPayload::Arrow { batch, source_format } => DataPayload::Arrow { batch: batch.clone(), source_format: *source_format },
+                DataPayload::Bytes { data, mime_type } => DataPayload::Bytes { data: data.clone(), mime_type: mime_type.clone() },
             };
             inputs.insert(input_port.name.clone(), cloned);
         } else {
             let port_name = &input_port.name;
-            let key = format!("{node_id}:{port_name}");
-            if let Some(input) = pipeline.provided_inputs.get(&key) {
-                inputs.insert(
-                    input_port.name.clone(),
-                    DataPayload::text(input.content.clone(), input.format),
-                );
+
+            // Check for single provided input (JSON or binary store)
+            let single_key = format!("{node_id}:{port_name}");
+            let has_binary = BINARY_STORE.with(|s| s.borrow().contains_key(&single_key));
+
+            if has_binary {
+                // Read directly from binary store
+                let data = BINARY_STORE.with(|s| s.borrow().get(&single_key).cloned().unwrap());
+                let mime = BINARY_MIME.with(|m| {
+                    m.borrow().get(&single_key).cloned()
+                        .unwrap_or_else(|| "application/octet-stream".to_string())
+                });
+                inputs.insert(input_port.name.clone(), DataPayload::Bytes { data, mime_type: mime });
+            } else if let Some(input) = pipeline.provided_inputs.get(&single_key) {
+                let payload = resolve_provided_input(input, node_id, port_name)?;
+                inputs.insert(input_port.name.clone(), payload);
+            }
+
+            // Check for indexed inputs (multi-file: "nodeId:port:0", "nodeId:port:1", ...)
+            let mut idx = 0;
+            loop {
+                let indexed_key = format!("{node_id}:{port_name}:{idx}");
+                let has_indexed_binary = BINARY_STORE.with(|s| s.borrow().contains_key(&indexed_key));
+
+                if has_indexed_binary {
+                    let data = BINARY_STORE.with(|s| s.borrow().get(&indexed_key).cloned().unwrap());
+                    let mime = BINARY_MIME.with(|m| {
+                        m.borrow().get(&indexed_key).cloned()
+                            .unwrap_or_else(|| "application/octet-stream".to_string())
+                    });
+                    inputs.insert(format!("{}:{}", input_port.name, idx), DataPayload::Bytes { data, mime_type: mime });
+                    idx += 1;
+                } else if let Some(input) = pipeline.provided_inputs.get(&indexed_key) {
+                    let payload = resolve_provided_input(input, node_id, port_name)?;
+                    inputs.insert(format!("{}:{}", input_port.name, idx), payload);
+                    idx += 1;
+                } else {
+                    break;
+                }
             }
         }
     }
 
     Ok(inputs)
+}
+
+fn resolve_provided_input(
+    input: &tooldeck_registry::ProvidedInput,
+    node_id: &str,
+    port_name: &str,
+) -> Result<DataPayload, String> {
+    match input {
+        tooldeck_registry::ProvidedInput::Text { content, format } => {
+            Ok(DataPayload::text(content.clone(), *format))
+        }
+        tooldeck_registry::ProvidedInput::Binary { mime_type } => {
+            // Binary data is in the binary store (set by the worker before execution)
+            let store_key = format!("{node_id}:{port_name}");
+            let data = BINARY_STORE.with(|s| s.borrow().get(&store_key).cloned())
+                .ok_or_else(|| format!("Binary data not found for {node_id}:{port_name}"))?;
+            Ok(DataPayload::Bytes { data, mime_type: mime_type.clone() })
+        }
+    }
 }
 
 // ============================================================

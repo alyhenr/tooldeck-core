@@ -15,4 +15,6 @@ tooldeck-registry = { path = "../tooldeck-registry" }
 tooldeck-json = { path = "../tooldeck-json" }
 tooldeck-csv = { path = "../tooldeck-csv" }
 tooldeck-transforms = { path = "../tooldeck-transforms" }
+tooldeck-image = { path = "../tooldeck-image" }
+tooldeck-pdf = { path = "../tooldeck-pdf" }
 getrandom = { version = "0.3", features = ["wasm_js"] }

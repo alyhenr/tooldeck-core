@@ -88,6 +88,7 @@ impl DataFormat {
 pub enum DataPayload {
     Text { content: String, format: DataFormat },
     Arrow { batch: RecordBatch, source_format: DataFormat },
+    Bytes { data: Vec<u8>, mime_type: String },
 }
 
 impl DataPayload {
@@ -108,11 +109,9 @@ impl DataPayload {
             DataPayload::Text { content, format } => match format {
                 DataFormat::Csv => csv_to_arrow(content),
                 DataFormat::Json | DataFormat::Ndjson => json_to_arrow(content),
-                _ => {
-                    // Best effort: try JSON first, then CSV
-                    json_to_arrow(content).or_else(|_| csv_to_arrow(content))
-                }
+                _ => json_to_arrow(content).or_else(|_| csv_to_arrow(content)),
             },
+            DataPayload::Bytes { .. } => Err("Cannot convert binary data to Arrow table".into()),
         }
     }
 
@@ -124,6 +123,24 @@ impl DataPayload {
                 DataFormat::Csv => arrow_to_csv(batch),
                 _ => arrow_to_json(batch),
             },
+            DataPayload::Bytes { .. } => Err("Cannot convert binary data to text".into()),
+        }
+    }
+
+    /// Get as raw bytes.
+    pub fn as_bytes(&self) -> Result<&[u8], String> {
+        match self {
+            DataPayload::Bytes { data, .. } => Ok(data),
+            DataPayload::Text { content, .. } => Ok(content.as_bytes()),
+            DataPayload::Arrow { .. } => Err("Cannot convert Arrow table to raw bytes".into()),
+        }
+    }
+
+    /// Get the MIME type (only for Bytes payloads).
+    pub fn mime_type(&self) -> Option<&str> {
+        match self {
+            DataPayload::Bytes { mime_type, .. } => Some(mime_type),
+            _ => None,
         }
     }
 
@@ -132,6 +149,7 @@ impl DataPayload {
         match self {
             DataPayload::Text { format, .. } => *format,
             DataPayload::Arrow { source_format, .. } => *source_format,
+            DataPayload::Bytes { .. } => DataFormat::Unknown,
         }
     }
 
@@ -140,11 +158,23 @@ impl DataPayload {
         match self {
             DataPayload::Arrow { batch, .. } => batch_to_preview(batch, max_rows),
             DataPayload::Text { content, .. } => {
-                // Try parsing as tabular for a richer preview
                 if let Ok(batch) = self.as_arrow() {
                     batch_to_preview(&batch, max_rows)
                 } else {
                     text_to_preview(content)
+                }
+            }
+            DataPayload::Bytes { data, mime_type } => {
+                let size_str = if data.len() < 1024 {
+                    format!("{} B", data.len())
+                } else if data.len() < 1048576 {
+                    format!("{:.1} KB", data.len() as f64 / 1024.0)
+                } else {
+                    format!("{:.1} MB", data.len() as f64 / 1048576.0)
+                };
+                NodePreview::Text {
+                    excerpt: format!("[{mime_type}] {size_str}"),
+                    total_bytes: data.len(),
                 }
             }
         }
@@ -154,9 +184,8 @@ impl DataPayload {
     pub fn row_count(&self) -> Option<usize> {
         match self {
             DataPayload::Arrow { batch, .. } => Some(batch.num_rows()),
-            DataPayload::Text { .. } => {
-                self.as_arrow().ok().map(|b| b.num_rows())
-            }
+            DataPayload::Text { .. } => self.as_arrow().ok().map(|b| b.num_rows()),
+            DataPayload::Bytes { .. } => None,
         }
     }
 }
@@ -193,6 +222,48 @@ impl ExecutionContext {
             .get(port)
             .ok_or_else(|| format!("Input '{port}' not connected"))?
             .as_text()
+    }
+
+    /// Get input as raw bytes.
+    pub fn input_bytes(&self, port: &str) -> Result<Vec<u8>, String> {
+        self.inputs
+            .get(port)
+            .ok_or_else(|| format!("Input '{port}' not connected"))?
+            .as_bytes()
+            .map(|b| b.to_vec())
+    }
+
+    /// Get multiple byte inputs for a multi-port (e.g., merge tools).
+    /// Looks for "port", "port:0", "port:1", etc.
+    pub fn input_bytes_multi(&self, port: &str) -> Result<Vec<Vec<u8>>, String> {
+        let mut results = Vec::new();
+
+        // Check for single key first
+        if let Some(payload) = self.inputs.get(port) {
+            results.push(payload.as_bytes()?.to_vec());
+        }
+
+        // Check for indexed keys: "port:0", "port:1", ...
+        let mut idx = 0;
+        loop {
+            let key = format!("{port}:{idx}");
+            if let Some(payload) = self.inputs.get(&key) {
+                results.push(payload.as_bytes()?.to_vec());
+                idx += 1;
+            } else {
+                break;
+            }
+        }
+
+        if results.is_empty() {
+            return Err(format!("Input '{port}' not connected"));
+        }
+        Ok(results)
+    }
+
+    /// Get the MIME type of a bytes input.
+    pub fn input_mime_type(&self, port: &str) -> Option<String> {
+        self.inputs.get(port).and_then(|p| p.mime_type().map(|s| s.to_string()))
     }
 
     /// Get the format of an input port's data.
@@ -247,6 +318,14 @@ impl ExecutionContext {
     /// Set text output with a format tag.
     pub fn set_output_text(&mut self, port: &str, text: String, format: DataFormat) {
         self.outputs.insert(port.to_string(), DataPayload::Text { content: text, format });
+    }
+
+    /// Set binary output with a MIME type.
+    pub fn set_output_bytes(&mut self, port: &str, data: Vec<u8>, mime_type: &str) {
+        self.outputs.insert(port.to_string(), DataPayload::Bytes {
+            data,
+            mime_type: mime_type.to_string(),
+        });
     }
 
     pub fn into_outputs(self) -> HashMap<String, DataPayload> {
@@ -372,9 +451,12 @@ pub struct PipelineDescription {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct ProvidedInput {
-    pub content: String,
-    pub format: DataFormat,
+#[serde(tag = "kind")]
+pub enum ProvidedInput {
+    #[serde(rename = "text")]
+    Text { content: String, format: DataFormat },
+    #[serde(rename = "binary")]
+    Binary { mime_type: String },
 }
 
 #[derive(Serialize, Deserialize)]

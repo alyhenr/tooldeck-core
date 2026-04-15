@@ -1,0 +1,8 @@
+[package]
+name = "tooldeck-image"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tooldeck-registry = { path = "../tooldeck-registry" }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
