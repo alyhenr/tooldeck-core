@@ -267,6 +267,23 @@ fn execute_pipeline(
 // INPUT RESOLUTION
 // ============================================================
 
+fn clone_payload(p: &DataPayload) -> DataPayload {
+    match p {
+        DataPayload::Text { content, format } => DataPayload::Text {
+            content: content.clone(),
+            format: *format,
+        },
+        DataPayload::Arrow { batch, source_format } => DataPayload::Arrow {
+            batch: batch.clone(),
+            source_format: *source_format,
+        },
+        DataPayload::Bytes { data, mime_type } => DataPayload::Bytes {
+            data: data.clone(),
+            mime_type: mime_type.clone(),
+        },
+    }
+}
+
 fn resolve_node_inputs(
     node_id: &str,
     handler: &dyn tooldeck_registry::ToolHandler,
@@ -277,62 +294,93 @@ fn resolve_node_inputs(
     let mut inputs: HashMap<String, DataPayload> = HashMap::new();
 
     for input_port in &spec.inputs {
-        let incoming = pipeline.edges.iter().find(|e| {
-            e.to.node == node_id && e.to.port == input_port.name
-        });
+        let port_name = &input_port.name;
+        let is_multi = input_port.multiple.unwrap_or(false);
 
-        if let Some(edge) = incoming {
-            let from_node = &edge.from.node;
-            let from_port = &edge.from.port;
-            let port_name = &input_port.name;
-            let key = format!("{from_node}:{from_port}");
-            let payload = data_store.get(&key)
+        // Collect ALL edges feeding this input port (was `.find()` — bug: missed
+        // additional edges on multi-input ports like MergePdfs' `pdfs` port).
+        let incoming_edges: Vec<_> = pipeline
+            .edges
+            .iter()
+            .filter(|e| e.to.node == node_id && e.to.port == *port_name)
+            .collect();
+
+        // --- Edge-provided inputs ---
+        if is_multi {
+            // Multi-port: each edge gets an indexed key that input_bytes_multi reads.
+            for (idx, edge) in incoming_edges.iter().enumerate() {
+                let key = format!("{}:{}", edge.from.node, edge.from.port);
+                let payload = data_store
+                    .get(&key)
+                    .ok_or_else(|| format!("No data at {key} for input {node_id}:{port_name}"))?;
+                inputs.insert(format!("{port_name}:{idx}"), clone_payload(payload));
+            }
+        } else if let Some(edge) = incoming_edges.first() {
+            // Single-port: only the first edge is meaningful (validation prevents more).
+            let key = format!("{}:{}", edge.from.node, edge.from.port);
+            let payload = data_store
+                .get(&key)
                 .ok_or_else(|| format!("No data at {key} for input {node_id}:{port_name}"))?;
+            inputs.insert(port_name.clone(), clone_payload(payload));
+        }
 
-            let cloned = match payload {
-                DataPayload::Text { content, format } => DataPayload::Text { content: content.clone(), format: *format },
-                DataPayload::Arrow { batch, source_format } => DataPayload::Arrow { batch: batch.clone(), source_format: *source_format },
-                DataPayload::Bytes { data, mime_type } => DataPayload::Bytes { data: data.clone(), mime_type: mime_type.clone() },
-            };
-            inputs.insert(input_port.name.clone(), cloned);
-        } else {
-            let port_name = &input_port.name;
+        // --- Provided inputs (files the user uploaded to this node) ---
+        // Rule: for multi-ports, provided inputs APPEND after edge-provided ones,
+        // continuing the index. For single-ports, only used when no edge was connected.
+        let edges_count = if is_multi { incoming_edges.len() } else { 0 };
 
-            // Check for single provided input (JSON or binary store)
+        // Non-indexed single provided input — only meaningful for single-ports with no edge.
+        if !is_multi && incoming_edges.is_empty() {
             let single_key = format!("{node_id}:{port_name}");
             let has_binary = BINARY_STORE.with(|s| s.borrow().contains_key(&single_key));
 
             if has_binary {
-                // Read directly from binary store
                 let data = BINARY_STORE.with(|s| s.borrow().get(&single_key).cloned().unwrap());
                 let mime = BINARY_MIME.with(|m| {
-                    m.borrow().get(&single_key).cloned()
+                    m.borrow()
+                        .get(&single_key)
+                        .cloned()
                         .unwrap_or_else(|| "application/octet-stream".to_string())
                 });
-                inputs.insert(input_port.name.clone(), DataPayload::Bytes { data, mime_type: mime });
+                inputs.insert(
+                    port_name.clone(),
+                    DataPayload::Bytes { data, mime_type: mime },
+                );
             } else if let Some(input) = pipeline.provided_inputs.get(&single_key) {
                 let payload = resolve_provided_input(input, node_id, port_name)?;
-                inputs.insert(input_port.name.clone(), payload);
+                inputs.insert(port_name.clone(), payload);
             }
+        }
 
-            // Check for indexed inputs (multi-file: "nodeId:port:0", "nodeId:port:1", ...)
-            let mut idx = 0;
+        // Indexed provided inputs (multi-file uploads at `{node}:{port}:{N}`).
+        // Only traversed for multi-ports or when no edge fed this port.
+        if is_multi || incoming_edges.is_empty() {
+            let mut provided_idx = 0;
             loop {
-                let indexed_key = format!("{node_id}:{port_name}:{idx}");
-                let has_indexed_binary = BINARY_STORE.with(|s| s.borrow().contains_key(&indexed_key));
+                let indexed_key = format!("{node_id}:{port_name}:{provided_idx}");
+                let has_indexed_binary =
+                    BINARY_STORE.with(|s| s.borrow().contains_key(&indexed_key));
 
                 if has_indexed_binary {
-                    let data = BINARY_STORE.with(|s| s.borrow().get(&indexed_key).cloned().unwrap());
+                    let data =
+                        BINARY_STORE.with(|s| s.borrow().get(&indexed_key).cloned().unwrap());
                     let mime = BINARY_MIME.with(|m| {
-                        m.borrow().get(&indexed_key).cloned()
+                        m.borrow()
+                            .get(&indexed_key)
+                            .cloned()
                             .unwrap_or_else(|| "application/octet-stream".to_string())
                     });
-                    inputs.insert(format!("{}:{}", input_port.name, idx), DataPayload::Bytes { data, mime_type: mime });
-                    idx += 1;
+                    let output_idx = edges_count + provided_idx;
+                    inputs.insert(
+                        format!("{port_name}:{output_idx}"),
+                        DataPayload::Bytes { data, mime_type: mime },
+                    );
+                    provided_idx += 1;
                 } else if let Some(input) = pipeline.provided_inputs.get(&indexed_key) {
                     let payload = resolve_provided_input(input, node_id, port_name)?;
-                    inputs.insert(format!("{}:{}", input_port.name, idx), payload);
-                    idx += 1;
+                    let output_idx = edges_count + provided_idx;
+                    inputs.insert(format!("{port_name}:{output_idx}"), payload);
+                    provided_idx += 1;
                 } else {
                     break;
                 }
@@ -412,4 +460,150 @@ fn topological_sort(pipeline: &PipelineDescription) -> Result<Vec<String>, Strin
     }
 
     Ok(sorted)
+}
+
+// ============================================================
+// TESTS
+// ============================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tooldeck_registry::{
+        ExecutionContext, PipelineEdge, PipelineNode, PortRef, PortSpec, ToolHandler, ToolSpec,
+    };
+
+    /// Minimal multi-port merger used only in tests.
+    struct FakeMerger;
+    impl ToolHandler for FakeMerger {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                id: "fake_merger".into(),
+                label: "Merger".into(),
+                description: "".into(),
+                category: "test".into(),
+                icon: "".into(),
+                inputs: vec![PortSpec {
+                    name: "items".into(),
+                    port_type: "Bytes".into(),
+                    format: None,
+                    multiple: Some(true),
+                    min: Some(2),
+                }],
+                outputs: vec![],
+                params: vec![],
+            }
+        }
+        fn execute(&self, _ctx: &mut ExecutionContext) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    /// Minimal single-port tool used only in tests.
+    struct FakeSingle;
+    impl ToolHandler for FakeSingle {
+        fn spec(&self) -> ToolSpec {
+            ToolSpec {
+                id: "fake_single".into(),
+                label: "Single".into(),
+                description: "".into(),
+                category: "test".into(),
+                icon: "".into(),
+                inputs: vec![PortSpec {
+                    name: "data".into(),
+                    port_type: "Bytes".into(),
+                    format: None,
+                    multiple: None,
+                    min: None,
+                }],
+                outputs: vec![],
+                params: vec![],
+            }
+        }
+        fn execute(&self, _ctx: &mut ExecutionContext) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn bytes_payload(s: &str) -> DataPayload {
+        DataPayload::Bytes {
+            data: s.as_bytes().to_vec(),
+            mime_type: "application/octet-stream".into(),
+        }
+    }
+
+    fn empty_node() -> PipelineNode {
+        PipelineNode {
+            tool_id: "src".into(),
+            params: HashMap::new(),
+        }
+    }
+
+    /// Bug fix: multiple edges feeding a multi-port must all be routed.
+    /// Before the fix, only the first edge was picked up and the tool errored
+    /// because it couldn't find the other inputs.
+    #[test]
+    fn resolve_inputs_routes_all_edges_to_multi_port() {
+        let mut nodes = HashMap::new();
+        nodes.insert("n1".into(), empty_node());
+        nodes.insert("n2".into(), empty_node());
+        nodes.insert("n3".into(), empty_node());
+
+        let pipeline = PipelineDescription {
+            nodes,
+            edges: vec![
+                PipelineEdge {
+                    from: PortRef { node: "n1".into(), port: "out".into() },
+                    to: PortRef { node: "n3".into(), port: "items".into() },
+                    order: None,
+                },
+                PipelineEdge {
+                    from: PortRef { node: "n2".into(), port: "out".into() },
+                    to: PortRef { node: "n3".into(), port: "items".into() },
+                    order: None,
+                },
+            ],
+            provided_inputs: HashMap::new(),
+        };
+
+        let mut data_store = HashMap::new();
+        data_store.insert("n1:out".into(), bytes_payload("FIRST"));
+        data_store.insert("n2:out".into(), bytes_payload("SECOND"));
+
+        let handler = FakeMerger;
+        let inputs = resolve_node_inputs("n3", &handler, &pipeline, &data_store)
+            .expect("resolve should succeed");
+
+        // Both edges must end up under indexed keys — NOT the plain "items" key.
+        assert!(inputs.contains_key("items:0"), "missing items:0");
+        assert!(inputs.contains_key("items:1"), "missing items:1");
+        assert!(!inputs.contains_key("items"), "plain items key should not be set for multi-port with edges");
+    }
+
+    /// Single-port tools keep the legacy plain-key behavior.
+    #[test]
+    fn resolve_inputs_single_port_uses_plain_key() {
+        let mut nodes = HashMap::new();
+        nodes.insert("n1".into(), empty_node());
+        nodes.insert("n2".into(), empty_node());
+
+        let pipeline = PipelineDescription {
+            nodes,
+            edges: vec![PipelineEdge {
+                from: PortRef { node: "n1".into(), port: "out".into() },
+                to: PortRef { node: "n2".into(), port: "data".into() },
+                order: None,
+            }],
+            provided_inputs: HashMap::new(),
+        };
+
+        let mut data_store = HashMap::new();
+        data_store.insert("n1:out".into(), bytes_payload("HELLO"));
+
+        let handler = FakeSingle;
+        let inputs = resolve_node_inputs("n2", &handler, &pipeline, &data_store).unwrap();
+
+        assert!(inputs.contains_key("data"));
+        assert!(!inputs.contains_key("data:0"));
+    }
 }
