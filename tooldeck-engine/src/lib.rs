@@ -606,4 +606,89 @@ mod tests {
         assert!(inputs.contains_key("data"));
         assert!(!inputs.contains_key("data:0"));
     }
+
+    // ─── Topological sort ──────────────────────────────────
+
+    fn simple_pipeline(edges: Vec<(&str, &str)>, node_ids: &[&str]) -> PipelineDescription {
+        let mut nodes = HashMap::new();
+        for id in node_ids {
+            nodes.insert((*id).into(), empty_node());
+        }
+        let edges = edges
+            .into_iter()
+            .map(|(from, to)| PipelineEdge {
+                from: PortRef { node: from.into(), port: "out".into() },
+                to: PortRef { node: to.into(), port: "in".into() },
+                order: None,
+            })
+            .collect();
+        PipelineDescription {
+            nodes,
+            edges,
+            provided_inputs: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn topo_sort_linear_chain() {
+        // a -> b -> c
+        let p = simple_pipeline(vec![("a", "b"), ("b", "c")], &["a", "b", "c"]);
+        let sorted = topological_sort(&p).unwrap();
+        // `a` must come before `b`, which must come before `c`.
+        let pos_a = sorted.iter().position(|x| x == "a").unwrap();
+        let pos_b = sorted.iter().position(|x| x == "b").unwrap();
+        let pos_c = sorted.iter().position(|x| x == "c").unwrap();
+        assert!(pos_a < pos_b);
+        assert!(pos_b < pos_c);
+        assert_eq!(sorted.len(), 3);
+    }
+
+    #[test]
+    fn topo_sort_diamond() {
+        // a -> b, a -> c, b -> d, c -> d
+        let p = simple_pipeline(
+            vec![("a", "b"), ("a", "c"), ("b", "d"), ("c", "d")],
+            &["a", "b", "c", "d"],
+        );
+        let sorted = topological_sort(&p).unwrap();
+        let pos = |id: &str| sorted.iter().position(|x| x == id).unwrap();
+        assert!(pos("a") < pos("b"));
+        assert!(pos("a") < pos("c"));
+        assert!(pos("b") < pos("d"));
+        assert!(pos("c") < pos("d"));
+    }
+
+    #[test]
+    fn topo_sort_detects_cycle() {
+        // a -> b -> a
+        let p = simple_pipeline(vec![("a", "b"), ("b", "a")], &["a", "b"]);
+        let err = topological_sort(&p).unwrap_err();
+        assert!(err.contains("Cycle detected"), "got: {err}");
+    }
+
+    #[test]
+    fn topo_sort_unknown_edge_target_errors() {
+        // Edge references a node that doesn't exist
+        let p = simple_pipeline(vec![("a", "ghost")], &["a"]);
+        let err = topological_sort(&p).unwrap_err();
+        assert!(err.contains("Unknown"), "got: {err}");
+    }
+
+    #[test]
+    fn topo_sort_empty_pipeline() {
+        let p = PipelineDescription {
+            nodes: HashMap::new(),
+            edges: vec![],
+            provided_inputs: HashMap::new(),
+        };
+        let sorted = topological_sort(&p).unwrap();
+        assert_eq!(sorted.len(), 0);
+    }
+
+    #[test]
+    fn topo_sort_isolated_nodes_with_no_edges() {
+        let p = simple_pipeline(vec![], &["x", "y", "z"]);
+        let sorted = topological_sort(&p).unwrap();
+        assert_eq!(sorted.len(), 3);
+    }
 }

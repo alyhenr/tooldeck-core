@@ -108,4 +108,48 @@ mod tests {
         let filtered = filter_rows(&batch, "active", "true").unwrap();
         assert_eq!(filtered.num_rows(), 2);
     }
+
+    #[test]
+    fn test_filter_no_match_returns_empty() {
+        let raw = r#"{"name":"Alice","tier":"pro"}
+{"name":"Bob","tier":"free"}"#;
+        let batch = json_to_arrow(raw).unwrap();
+        let filtered = filter_rows(&batch, "tier", "enterprise").unwrap();
+        assert_eq!(filtered.num_rows(), 0);
+        // Schema should be preserved even with 0 rows
+        assert_eq!(filtered.num_columns(), batch.num_columns());
+    }
+
+    #[test]
+    fn test_filter_missing_column_errors() {
+        let raw = r#"{"name":"Alice"}"#;
+        let batch = json_to_arrow(raw).unwrap();
+        let err = filter_rows(&batch, "nonexistent", "foo").unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    #[test]
+    fn test_filter_on_empty_input_returns_empty() {
+        // Arrow can't parse a completely empty JSON, so use an NDJSON with 1
+        // row and filter to zero.
+        let raw = r#"{"name":"Alice"}"#;
+        let batch = json_to_arrow(raw).unwrap();
+        let filtered = filter_rows(&batch, "name", "NoMatch").unwrap();
+        assert_eq!(filtered.num_rows(), 0);
+    }
+
+    #[test]
+    fn test_filter_large_dataset() {
+        // Build a 1000-row NDJSON with alternating tiers
+        let rows: Vec<String> = (0..1000)
+            .map(|i| format!(r#"{{"id":{i},"tier":"{}"}}"#, if i % 3 == 0 { "pro" } else { "free" }))
+            .collect();
+        let raw = rows.join("\n");
+        let batch = json_to_arrow(&raw).unwrap();
+        assert_eq!(batch.num_rows(), 1000);
+
+        let pro_only = filter_rows(&batch, "tier", "pro").unwrap();
+        // Expect ~334 rows (every 3rd starting from 0: 0, 3, 6, ...)
+        assert_eq!(pro_only.num_rows(), 334);
+    }
 }

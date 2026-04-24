@@ -46,6 +46,34 @@ fn mime_to_format(name: &str) -> ImageFormat {
 // REMOVE BACKGROUND
 // ============================================================
 
+/// Remove the background from an image by sampling the top-left corner color
+/// and making any pixel within `tolerance` transparent. Output is PNG.
+pub fn remove_background_bytes(bytes: &[u8], tolerance: u8) -> Result<Vec<u8>, String> {
+    let (img, _) = decode_image(bytes)?;
+    let mut rgba = img.to_rgba8();
+    let (width, height) = rgba.dimensions();
+
+    let corners = [
+        rgba.get_pixel(0, 0),
+        rgba.get_pixel(width - 1, 0),
+        rgba.get_pixel(0, height - 1),
+        rgba.get_pixel(width - 1, height - 1),
+    ];
+    let bg = most_common_color(&corners);
+
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = rgba.get_pixel(x, y);
+            if color_distance(pixel, &bg) <= tolerance as u32 {
+                rgba.put_pixel(x, y, Rgba([0, 0, 0, 0]));
+            }
+        }
+    }
+
+    let result = DynamicImage::ImageRgba8(rgba);
+    encode_image(&result, ImageFormat::Png)
+}
+
 pub struct RemoveBackground;
 
 impl ToolHandler for RemoveBackground {
@@ -67,35 +95,7 @@ impl ToolHandler for RemoveBackground {
     fn execute(&self, ctx: &mut ExecutionContext) -> Result<(), String> {
         let bytes = ctx.input_bytes("image")?;
         let tolerance = ctx.param_f64("tolerance").unwrap_or(20.0) as u8;
-
-        let (img, _) = decode_image(&bytes)?;
-        let mut rgba = img.to_rgba8();
-        let (width, height) = rgba.dimensions();
-
-        // Sample background color from the corners
-        let corners = [
-            rgba.get_pixel(0, 0),
-            rgba.get_pixel(width - 1, 0),
-            rgba.get_pixel(0, height - 1),
-            rgba.get_pixel(width - 1, height - 1),
-        ];
-
-        // Use the most common corner color as the background
-        let bg = most_common_color(&corners);
-
-        // Make pixels similar to bg color transparent
-        for y in 0..height {
-            for x in 0..width {
-                let pixel = rgba.get_pixel(x, y);
-                if color_distance(pixel, &bg) <= tolerance as u32 {
-                    rgba.put_pixel(x, y, Rgba([0, 0, 0, 0]));
-                }
-            }
-        }
-
-        // Always output PNG (supports transparency)
-        let result = DynamicImage::ImageRgba8(rgba);
-        let output = encode_image(&result, ImageFormat::Png)?;
+        let output = remove_background_bytes(&bytes, tolerance)?;
         ctx.set_output_bytes("result", output, "image/png");
         Ok(())
     }
@@ -116,6 +116,45 @@ fn color_distance(a: &Rgba<u8>, b: &Rgba<u8>) -> u32 {
 // ============================================================
 // RESIZE IMAGE
 // ============================================================
+
+/// Resize an image, optionally preserving aspect ratio. Returns (bytes, mime).
+pub fn resize_image_bytes(
+    bytes: &[u8],
+    target_width: u32,
+    target_height: u32,
+    maintain_aspect: bool,
+) -> Result<(Vec<u8>, &'static str), String> {
+    if target_width == 0 && target_height == 0 {
+        return Err("Specify at least width or height".into());
+    }
+
+    let (img, format) = decode_image(bytes)?;
+    let (orig_w, orig_h) = img.dimensions();
+
+    let (new_w, new_h) = if maintain_aspect {
+        if target_width > 0 && target_height > 0 {
+            let ratio_w = target_width as f64 / orig_w as f64;
+            let ratio_h = target_height as f64 / orig_h as f64;
+            let ratio = ratio_w.min(ratio_h);
+            ((orig_w as f64 * ratio) as u32, (orig_h as f64 * ratio) as u32)
+        } else if target_width > 0 {
+            let ratio = target_width as f64 / orig_w as f64;
+            (target_width, (orig_h as f64 * ratio) as u32)
+        } else {
+            let ratio = target_height as f64 / orig_h as f64;
+            ((orig_w as f64 * ratio) as u32, target_height)
+        }
+    } else {
+        (
+            if target_width > 0 { target_width } else { orig_w },
+            if target_height > 0 { target_height } else { orig_h },
+        )
+    };
+
+    let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
+    let output = encode_image(&resized, format)?;
+    Ok((output, format_to_mime(format)))
+}
 
 pub struct ResizeImage;
 
@@ -142,38 +181,9 @@ impl ToolHandler for ResizeImage {
         let target_width = ctx.param_f64("width").unwrap_or(0.0) as u32;
         let target_height = ctx.param_f64("height").unwrap_or(0.0) as u32;
         let maintain_aspect = ctx.param_bool("maintain_aspect").unwrap_or(true);
-
-        if target_width == 0 && target_height == 0 {
-            return Err("Specify at least width or height".into());
-        }
-
-        let (img, format) = decode_image(&bytes)?;
-        let (orig_w, orig_h) = img.dimensions();
-
-        let (new_w, new_h) = if maintain_aspect {
-            if target_width > 0 && target_height > 0 {
-                // Fit within the box
-                let ratio_w = target_width as f64 / orig_w as f64;
-                let ratio_h = target_height as f64 / orig_h as f64;
-                let ratio = ratio_w.min(ratio_h);
-                ((orig_w as f64 * ratio) as u32, (orig_h as f64 * ratio) as u32)
-            } else if target_width > 0 {
-                let ratio = target_width as f64 / orig_w as f64;
-                (target_width, (orig_h as f64 * ratio) as u32)
-            } else {
-                let ratio = target_height as f64 / orig_h as f64;
-                ((orig_w as f64 * ratio) as u32, target_height)
-            }
-        } else {
-            (
-                if target_width > 0 { target_width } else { orig_w },
-                if target_height > 0 { target_height } else { orig_h },
-            )
-        };
-
-        let resized = img.resize_exact(new_w, new_h, image::imageops::FilterType::Lanczos3);
-        let output = encode_image(&resized, format)?;
-        ctx.set_output_bytes("result", output, format_to_mime(format));
+        let (output, mime) =
+            resize_image_bytes(&bytes, target_width, target_height, maintain_aspect)?;
+        ctx.set_output_bytes("result", output, mime);
         Ok(())
     }
 }
@@ -181,6 +191,19 @@ impl ToolHandler for ResizeImage {
 // ============================================================
 // CONVERT IMAGE FORMAT
 // ============================================================
+
+/// Convert an image to a new format. `target_format_name` is case-insensitive:
+/// `"png"`, `"jpg"` / `"jpeg"`, `"webp"`.
+/// Returns (bytes, mime).
+pub fn convert_image_bytes(
+    bytes: &[u8],
+    target_format_name: &str,
+) -> Result<(Vec<u8>, &'static str), String> {
+    let (img, _) = decode_image(bytes)?;
+    let target_format = mime_to_format(target_format_name);
+    let output = encode_image(&img, target_format)?;
+    Ok((output, format_to_mime(target_format)))
+}
 
 pub struct ConvertImage;
 
@@ -203,11 +226,8 @@ impl ToolHandler for ConvertImage {
     fn execute(&self, ctx: &mut ExecutionContext) -> Result<(), String> {
         let bytes = ctx.input_bytes("image")?;
         let output_format_name = ctx.param_str("output_format").unwrap_or("PNG");
-
-        let (img, _) = decode_image(&bytes)?;
-        let target_format = mime_to_format(output_format_name);
-        let output = encode_image(&img, target_format)?;
-        ctx.set_output_bytes("result", output, format_to_mime(target_format));
+        let (output, mime) = convert_image_bytes(&bytes, output_format_name)?;
+        ctx.set_output_bytes("result", output, mime);
         Ok(())
     }
 }

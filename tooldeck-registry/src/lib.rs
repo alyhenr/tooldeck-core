@@ -700,17 +700,27 @@ fn text_to_preview(text: &str) -> NodePreview {
 /// Used by tools for filtering, deduplication, and other comparisons.
 /// Produces clean output for all types including lists and nested objects.
 pub fn cell_to_string(col: &dyn Array, row: usize) -> String {
+    use arrow::datatypes::{
+        Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    };
     if col.is_null(row) { return String::new(); }
     match col.data_type() {
-        // Fast path for common primitives — avoid JSON overhead
+        // Fast path for common primitives — avoid JSON overhead.
+        // `as_primitive::<T>` requires T to match the array's actual element type
+        // EXACTLY, so each integer / float width needs its own branch.
         DataType::Utf8 => col.as_string::<i32>().value(row).to_string(),
         DataType::LargeUtf8 => col.as_string::<i64>().value(row).to_string(),
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 =>
-            col.as_primitive::<arrow::datatypes::Int64Type>().value(row).to_string(),
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 =>
-            col.as_primitive::<arrow::datatypes::UInt64Type>().value(row).to_string(),
-        DataType::Float32 | DataType::Float64 =>
-            col.as_primitive::<arrow::datatypes::Float64Type>().value(row).to_string(),
+        DataType::Int8 => col.as_primitive::<Int8Type>().value(row).to_string(),
+        DataType::Int16 => col.as_primitive::<Int16Type>().value(row).to_string(),
+        DataType::Int32 => col.as_primitive::<Int32Type>().value(row).to_string(),
+        DataType::Int64 => col.as_primitive::<Int64Type>().value(row).to_string(),
+        DataType::UInt8 => col.as_primitive::<UInt8Type>().value(row).to_string(),
+        DataType::UInt16 => col.as_primitive::<UInt16Type>().value(row).to_string(),
+        DataType::UInt32 => col.as_primitive::<UInt32Type>().value(row).to_string(),
+        DataType::UInt64 => col.as_primitive::<UInt64Type>().value(row).to_string(),
+        DataType::Float32 => col.as_primitive::<Float32Type>().value(row).to_string(),
+        DataType::Float64 => col.as_primitive::<Float64Type>().value(row).to_string(),
         DataType::Boolean => col.as_boolean().value(row).to_string(),
         // Complex types (List, Struct, etc.) — serialize as JSON string
         _ => {
@@ -721,16 +731,24 @@ pub fn cell_to_string(col: &dyn Array, row: usize) -> String {
 }
 
 fn arrow_cell_to_json(col: &dyn Array, row: usize) -> serde_json::Value {
+    use arrow::datatypes::{
+        Float32Type, Float64Type, Int16Type, Int32Type, Int64Type, Int8Type,
+        UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+    };
     if col.is_null(row) { return serde_json::Value::Null; }
     match col.data_type() {
         DataType::Utf8 => serde_json::Value::String(col.as_string::<i32>().value(row).to_string()),
         DataType::LargeUtf8 => serde_json::Value::String(col.as_string::<i64>().value(row).to_string()),
-        DataType::Int8 | DataType::Int16 | DataType::Int32 | DataType::Int64 =>
-            serde_json::json!(col.as_primitive::<arrow::datatypes::Int64Type>().value(row)),
-        DataType::UInt8 | DataType::UInt16 | DataType::UInt32 | DataType::UInt64 =>
-            serde_json::json!(col.as_primitive::<arrow::datatypes::UInt64Type>().value(row)),
-        DataType::Float32 | DataType::Float64 =>
-            serde_json::json!(col.as_primitive::<arrow::datatypes::Float64Type>().value(row)),
+        DataType::Int8 => serde_json::json!(col.as_primitive::<Int8Type>().value(row)),
+        DataType::Int16 => serde_json::json!(col.as_primitive::<Int16Type>().value(row)),
+        DataType::Int32 => serde_json::json!(col.as_primitive::<Int32Type>().value(row)),
+        DataType::Int64 => serde_json::json!(col.as_primitive::<Int64Type>().value(row)),
+        DataType::UInt8 => serde_json::json!(col.as_primitive::<UInt8Type>().value(row)),
+        DataType::UInt16 => serde_json::json!(col.as_primitive::<UInt16Type>().value(row)),
+        DataType::UInt32 => serde_json::json!(col.as_primitive::<UInt32Type>().value(row)),
+        DataType::UInt64 => serde_json::json!(col.as_primitive::<UInt64Type>().value(row)),
+        DataType::Float32 => serde_json::json!(col.as_primitive::<Float32Type>().value(row)),
+        DataType::Float64 => serde_json::json!(col.as_primitive::<Float64Type>().value(row)),
         DataType::Boolean => serde_json::Value::Bool(col.as_boolean().value(row)),
         _ => serde_json::Value::String(format!("{:?}", col.slice(row, 1))),
     }

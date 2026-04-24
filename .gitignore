@@ -37,3 +37,7 @@ Thumbs.db
 *.swp
 *.swo
 *~
+# -------------------------------------------------------------------------
+# Internal testing frameworks, docs and sample files
+#
+TESTING.MD

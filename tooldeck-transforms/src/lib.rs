@@ -827,4 +827,183 @@ mod tests {
         let result = deduplicate(&batch, &["name"]).unwrap();
         assert_eq!(result.num_rows(), 3); // Alice appears once
     }
+
+    // ─── GroupBy ────────────────────────────────────────────────
+
+    fn cell_str(batch: &RecordBatch, row: usize, col: &str) -> String {
+        let idx = batch.schema().index_of(col).unwrap();
+        cell_to_string(batch.column(idx).as_ref(), row)
+    }
+
+    #[test]
+    fn test_group_by_count() {
+        let batch = sample_batch();
+        let result = group_by(&batch, &["city"], &["name:count"]).unwrap();
+        // 3 distinct cities: NYC (x2), LA (x1), SF (x1)
+        assert_eq!(result.num_rows(), 3);
+        assert!(result.schema().field_with_name("name_count").is_ok());
+
+        let mut counts_by_city: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        for row in 0..result.num_rows() {
+            counts_by_city.insert(
+                cell_str(&result, row, "city"),
+                cell_str(&result, row, "name_count"),
+            );
+        }
+        assert_eq!(counts_by_city.get("NYC").unwrap(), "2");
+        assert_eq!(counts_by_city.get("LA").unwrap(), "1");
+        assert_eq!(counts_by_city.get("SF").unwrap(), "1");
+    }
+
+    #[test]
+    fn test_group_by_sum_avg() {
+        let batch = sample_batch();
+        let result = group_by(&batch, &["city"], &["age:sum", "age:avg"]).unwrap();
+        assert_eq!(result.num_rows(), 3);
+
+        let mut by_city: std::collections::HashMap<String, (String, String)> =
+            std::collections::HashMap::new();
+        for row in 0..result.num_rows() {
+            by_city.insert(
+                cell_str(&result, row, "city"),
+                (cell_str(&result, row, "age_sum"), cell_str(&result, row, "age_avg")),
+            );
+        }
+        // NYC: Alice 30 + Alice 30 = 60 sum, 30 avg
+        assert_eq!(by_city.get("NYC").unwrap().0, "60");
+        assert_eq!(by_city.get("NYC").unwrap().1, "30");
+        // LA: Bob 25
+        assert_eq!(by_city.get("LA").unwrap().0, "25");
+    }
+
+    #[test]
+    fn test_group_by_rejects_malformed_aggregation() {
+        let batch = sample_batch();
+        let err = group_by(&batch, &["city"], &["badformat"]).unwrap_err();
+        assert!(err.contains("Invalid aggregation"), "got: {err}");
+    }
+
+    // ─── AddColumn ──────────────────────────────────────────────
+
+    #[test]
+    fn test_add_column_arithmetic() {
+        let batch = sample_batch();
+        let result = add_column(&batch, "age_double", "age * 2").unwrap();
+        assert!(result.schema().field_with_name("age_double").is_ok());
+        assert_eq!(result.num_rows(), 4);
+
+        // Row 0: Alice age 30 -> 60
+        assert_eq!(cell_str(&result, 0, "age_double"), "60");
+        // Row 1: Bob age 25 -> 50
+        assert_eq!(cell_str(&result, 1, "age_double"), "50");
+    }
+
+    #[test]
+    fn test_add_column_string_concat() {
+        let batch = sample_batch();
+        let result = add_column(&batch, "label", "name + ' from ' + city").unwrap();
+        assert_eq!(cell_str(&result, 0, "label"), "Alice from NYC");
+        assert_eq!(cell_str(&result, 1, "label"), "Bob from LA");
+    }
+
+    #[test]
+    fn test_add_column_division_by_zero_safe() {
+        let batch = sample_batch();
+        // Any row divided by 0 should return 0, not panic
+        let result = add_column(&batch, "weird", "age / 0").unwrap();
+        assert_eq!(cell_str(&result, 0, "weird"), "0");
+    }
+
+    // ─── TextReplace ────────────────────────────────────────────
+
+    #[test]
+    fn test_text_replace_basic() {
+        let batch = sample_batch();
+        let result = text_replace(&batch, "city", "NYC", "New York").unwrap();
+        assert_eq!(cell_str(&result, 0, "city"), "New York");
+        assert_eq!(cell_str(&result, 1, "city"), "LA"); // untouched
+        assert_eq!(cell_str(&result, 2, "city"), "New York");
+    }
+
+    #[test]
+    fn test_text_replace_empty_replacement_strips_text() {
+        let batch = sample_batch();
+        let result = text_replace(&batch, "name", "Alice", "").unwrap();
+        assert_eq!(cell_str(&result, 0, "name"), "");
+        assert_eq!(cell_str(&result, 1, "name"), "Bob");
+    }
+
+    #[test]
+    fn test_text_replace_missing_column_errors() {
+        let batch = sample_batch();
+        let err = text_replace(&batch, "nonexistent", "a", "b").unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
+
+    // ─── JoinTables ─────────────────────────────────────────────
+
+    fn orders_batch() -> RecordBatch {
+        // "customer_id" joins to sample_batch's "name"
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("customer_id", DataType::Utf8, false),
+            Field::new("amount", DataType::Int32, false),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["Alice", "Bob", "Alice", "Zelda"])),
+                Arc::new(Int32Array::from(vec![100, 250, 50, 999])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_join_tables_inner() {
+        let customers = sample_batch();
+        let orders = orders_batch();
+        let result = join_tables(&customers, &orders, "name", "customer_id", "inner").unwrap();
+
+        // Alice appears twice in customers AND twice in orders -> 4 matches
+        // Bob: 1 × 1 = 1 match
+        // Charlie: no match, skipped
+        // Zelda: not in customers, skipped
+        // Expected total: 5 rows
+        assert_eq!(result.num_rows(), 5);
+        // Join key column "customer_id" should NOT appear (avoided duplication)
+        assert!(result.schema().field_with_name("customer_id").is_err());
+        assert!(result.schema().field_with_name("amount").is_ok());
+    }
+
+    #[test]
+    fn test_join_tables_left_preserves_unmatched() {
+        let customers = sample_batch();
+        let orders = orders_batch();
+        let result = join_tables(&customers, &orders, "name", "customer_id", "left").unwrap();
+
+        // Left join: all 4 customer rows preserved.
+        // Alice (x2 rows) each match 2 orders -> 4 rows. Bob -> 1 row. Charlie has no match -> 1 row with blanks.
+        // Total: 4 + 1 + 1 = 6 rows
+        assert_eq!(result.num_rows(), 6);
+        // Charlie's row should have empty amount (unmatched)
+        let mut found_charlie_blank = false;
+        for row in 0..result.num_rows() {
+            if cell_str(&result, row, "name") == "Charlie"
+                && cell_str(&result, row, "amount").is_empty()
+            {
+                found_charlie_blank = true;
+            }
+        }
+        assert!(found_charlie_blank, "left join should preserve Charlie with blank amount");
+    }
+
+    #[test]
+    fn test_join_tables_missing_key_column_errors() {
+        let customers = sample_batch();
+        let orders = orders_batch();
+        let err = join_tables(&customers, &orders, "wrong_key", "customer_id", "inner")
+            .unwrap_err();
+        assert!(err.contains("not found"), "got: {err}");
+    }
 }
